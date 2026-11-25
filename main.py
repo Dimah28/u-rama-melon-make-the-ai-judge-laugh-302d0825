@@ -23,10 +23,19 @@ turn is a shrug, not a surprise).
 Deterministic: fixed string, stdlib only, no network, no randomness.
 Both runs write byte-identical output.
 
+Revision (reviser, 25 Nov 2026): gate validation moved into a
+standalone validate_entry() helper so the rules are testable in
+isolation; the writer now rejects control characters and writes
+atomically (tempfile in the output dir + fsync + os.replace) so a
+crash can never leave a half-written entry.txt. Entry text itself
+is unchanged.
+
   mkdir -p out && MAKEFUN_OUTPUT_DIR=out python3 main.py
 """
 
 import os
+import tempfile
+import unicodedata
 
 JOKE = (
     "HR said to bring my whole self to work, so I brought my "
@@ -35,24 +44,60 @@ JOKE = (
 )
 
 
-def _validate(joke: str) -> None:
+def validate_entry(entry: str) -> str:
     """Gate: UTF-8 text of 1-200 characters, not only whitespace,
-    exactly one line. Fail loudly instead of writing an entry
-    the gate would refuse."""
-    if not 1 <= len(joke) <= 200:
-        raise SystemExit(f"joke is {len(joke)} characters, must be 1-200")
-    if not any(not ch.isspace() for ch in joke):
-        raise SystemExit("joke must contain a non-whitespace character")
-    if "\n" in joke or "\r" in joke:
-        raise SystemExit("joke must be a single line")
+    exactly one line, and free of control characters. Returns the
+    entry unchanged on success; raises ValueError otherwise so a
+    bad entry fails loudly instead of writing something the gate
+    would refuse."""
+    if not 1 <= len(entry) <= 200:
+        raise ValueError(f"entry is {len(entry)} characters, must be 1-200")
+    if not any(not ch.isspace() for ch in entry):
+        raise ValueError("entry must contain a non-whitespace character")
+    if "\n" in entry or "\r" in entry:
+        raise ValueError("entry must be a single line")
+    bad = [
+        ch
+        for ch in entry
+        if unicodedata.category(ch) in ("Cc", "Cf")
+        or ch in ("\u007f", "\ufeff")
+    ]
+    if bad:
+        raise ValueError(
+            "entry contains control characters: "
+            + ", ".join(f"U+{ord(ch):04X}" for ch in bad)
+        )
+    return entry
+
+
+def write_entry(entry: str, out_dir: str) -> str:
+    """Write entry atomically to <out_dir>/entry.txt: tempfile in
+    the same directory, fsync, then os.replace, so readers never
+    see a partial file. No trailing newline. Returns the path."""
+    os.makedirs(out_dir, exist_ok=True)
+    target = os.path.join(out_dir, "entry.txt")
+    fd, tmp_path = tempfile.mkstemp(
+        dir=out_dir, prefix=".entry.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(entry)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, target)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    return target
 
 
 def main() -> None:
-    _validate(JOKE)
+    entry = validate_entry(JOKE)
     out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-    os.makedirs(out_dir, exist_ok=True)
-    with open(os.path.join(out_dir, "entry.txt"), "w", encoding="utf-8") as f:
-        f.write(JOKE)
+    write_entry(entry, out_dir)
 
 
 if __name__ == "__main__":
